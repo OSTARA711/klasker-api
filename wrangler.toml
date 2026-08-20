@@ -1,3 +1,7 @@
 name = "klasker-api"
 main = "src/index.ts"
 compatibility_date = "2026-08-18"
+
+[vars]
+SCANNER_URL1 = "https://scanner1.klasker.com"
+SCANNER_URL2 = "https://scanner2.klasker.com"
