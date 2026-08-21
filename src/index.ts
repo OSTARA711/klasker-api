@@ -8,10 +8,88 @@ export default {
   ): Promise<Response> {
     const url = new URL(request.url);
 
+    /*
+     * Ably authentication endpoint.
+     *
+     * The browser supplies an analysis ID and receives a short-lived
+     * TokenRequest restricted to that analysis channel.
+     *
+     * This uses the dedicated browser Subscribe-only Ably key.
+     * The Worker publish key remains separate.
+     */
+    if (url.pathname === "/api/ably-auth" && request.method === "GET") {
+      const analysisId = url.searchParams.get("analysis_id");
+
+      if (!analysisId) {
+        return Response.json(
+          { error: "An analysis ID is required." },
+          {
+            status: 400,
+            headers: corsHeaders(),
+          },
+        );
+      }
+
+      if (
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+          analysisId,
+        )
+      ) {
+        return Response.json(
+          { error: "Invalid analysis ID." },
+          {
+            status: 400,
+            headers: corsHeaders(),
+          },
+        );
+      }
+
+      try {
+        const tokenRequest = await createAblyTokenRequest(
+          env.ABLY_BROWSER_API_KEY,
+          `klasker:analysis:${analysisId}`,
+        );
+
+        return Response.json(
+          tokenRequest,
+          {
+            status: 200,
+            headers: {
+              ...corsHeaders(),
+              "Cache-Control": "no-store",
+            },
+          },
+        );
+      } catch (error) {
+        console.error("Ably authentication failed:", error);
+
+        return Response.json(
+          { error: "Unable to authenticate with Ably." },
+          {
+            status: 500,
+            headers: corsHeaders(),
+          },
+        );
+      }
+    }
+
+    /*
+     * CORS preflight for browser requests to the API.
+     */
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders(),
+      });
+    }
+
     if (url.pathname !== "/api/analysis" || request.method !== "POST") {
       return Response.json(
         { error: "Not found." },
-        { status: 404 },
+        {
+          status: 404,
+          headers: corsHeaders(),
+        },
       );
     }
 
@@ -22,7 +100,10 @@ export default {
     } catch {
       return Response.json(
         { error: "Request body must be valid JSON." },
-        { status: 400 },
+        {
+          status: 400,
+          headers: corsHeaders(),
+        },
       );
     }
 
@@ -34,7 +115,10 @@ export default {
     ) {
       return Response.json(
         { error: "A URL is required." },
-        { status: 400 },
+        {
+          status: 400,
+          headers: corsHeaders(),
+        },
       );
     }
 
@@ -44,7 +128,10 @@ export default {
     ) {
       return Response.json(
         { error: "An analysis ID is required." },
-        { status: 400 },
+        {
+          status: 400,
+          headers: corsHeaders(),
+        },
       );
     }
 
@@ -57,7 +144,10 @@ export default {
     ) {
       return Response.json(
         { error: "Invalid analysis ID." },
-        { status: 400 },
+        {
+          status: 400,
+          headers: corsHeaders(),
+        },
       );
     }
 
@@ -68,22 +158,32 @@ export default {
     } catch {
       return Response.json(
         { error: "Invalid URL." },
-        { status: 400 },
+        {
+          status: 400,
+          headers: corsHeaders(),
+        },
       );
     }
 
     if (target.protocol !== "http:" && target.protocol !== "https:") {
       return Response.json(
         { error: "Only HTTP and HTTPS URLs are supported." },
-        { status: 400 },
+        {
+          status: 400,
+          headers: corsHeaders(),
+        },
       );
     }
 
     const channel = `klasker:analysis:${analysisId}`;
 
-    // Ably is deliberately best-effort at this stage.
-    // A temporary Ably failure must not prevent the analysis
-    // from being dispatched to a scanner.
+    /*
+     * Ably is deliberately best-effort at this stage.
+     * A temporary Ably failure must not prevent the analysis
+     * from being dispatched to a scanner.
+     *
+     * This uses the dedicated Worker Publish key.
+     */
     await publishAbly(
       env.ABLY_API_KEY,
       channel,
@@ -104,8 +204,10 @@ export default {
       url: target.toString(),
     });
 
-    // The scanner work continues independently of the HTTP
-    // request. The client receives 202 immediately.
+    /*
+     * The scanner work continues independently of the HTTP
+     * request. The client receives 202 immediately.
+     */
     ctx.waitUntil(
       runAnalysis(
         env,
@@ -124,12 +226,133 @@ export default {
       {
         status: 202,
         headers: {
+          ...corsHeaders(),
           "Cache-Control": "no-store",
         },
       },
     );
   },
 };
+
+async function createAblyTokenRequest(
+  apiKey: string,
+  channel: string,
+): Promise<{
+  keyName: string;
+  ttl: number;
+  capability: string;
+  timestamp: number;
+  nonce: string;
+  mac: string;
+}> {
+  const separator = apiKey.indexOf(":");
+
+  if (separator === -1) {
+    throw new Error("Invalid Ably API key format.");
+  }
+
+  const keyName = apiKey.slice(0, separator);
+  const keySecret = apiKey.slice(separator + 1);
+
+  if (!keyName || !keySecret) {
+    throw new Error("Invalid Ably API key.");
+  }
+
+  // Five minutes is more than enough for the browser to establish
+  // the realtime connection while keeping the token short-lived.
+  const ttl = 5 * 60 * 1000;
+
+  const timestamp = Date.now();
+
+  const random = new Uint8Array(24);
+  crypto.getRandomValues(random);
+
+  const nonce = bytesToBase64Url(random);
+
+  /*
+   * The browser only needs to receive messages from this particular
+   * analysis channel. It must not be able to publish or access other
+   * channels with this token.
+   */
+  const capability = JSON.stringify({
+    [channel]: ["subscribe"],
+  });
+
+  /*
+   * Ably requires these fields in this exact order, each followed
+   * by a newline:
+   *
+   * keyName
+   * ttl
+   * capability
+   * clientId
+   * timestamp
+   * nonce
+   */
+  const canonical = [
+    keyName,
+    String(ttl),
+    capability,
+    "",
+    String(timestamp),
+    nonce,
+  ].join("\n") + "\n";
+
+  const encoder = new TextEncoder();
+
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(keySecret),
+    {
+      name: "HMAC",
+      hash: "SHA-256",
+    },
+    false,
+    ["sign"],
+  );
+
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    cryptoKey,
+    encoder.encode(canonical),
+  );
+
+  const mac = bytesToBase64(new Uint8Array(signature));
+
+  return {
+    keyName,
+    ttl,
+    capability,
+    timestamp,
+    nonce,
+    mac,
+  };
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+
+  return btoa(binary);
+}
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+  return bytesToBase64(bytes)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+function corsHeaders(): Record<string, string> {
+  return {
+    "Access-Control-Allow-Origin": "https://www.klasker.com",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+  };
+}
 
 async function runAnalysis(
   env: Env,
